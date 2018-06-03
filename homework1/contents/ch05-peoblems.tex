@@ -1,0 +1,37 @@
+\begin{center}
+    \section{遇到的坑}
+\end{center}
+
+\setlength{\parindent}{2em}
+\subsection{jemalloc的安装}
+jemalloc自己实现了对glibc中的malloc函数的hook操作，于是我们可以直接下载jemalloc，解压至指定目录，使用参数\Verb+./configure --prefix=/path --enable-debug+就可以得到有调试符号的jemalloc了。
+
+然后我们就可以通过在\Verb+ /etc/ld.so.conf+中添加编译好jemalloc的位置，保存之后运行命令\Verb+ ldconfig+，编译程序的时候就可以使用动态链接库的方式链接了（如下代码第3、4行所示）：
+\begin{minted}[breaklines, frame=lines, linenos]{makefile}
+PROGRAMS = fastbin_dup fastbin_dup_into_stack fastbin_dup_consolidate unsafe_unlink house_of_spirit poison_null_byte malloc_playground first_fit house_of_lore overlapping_chunks overlapping_chunks_2 house_of_force unsorted_bin_attack house_of_einherjar house_of_orange
+CFLAGS += -std=c99 -g3
+LDFLAGS += -L/usr/local/jemalloc/lib
+LDLIBS += -ljemalloc
+
+all: $(PROGRAMS)
+clean:
+    rm -f $(PROGRAMS)
+\end{minted}
+
+\subsection{在Ubuntu 16.04下使用高版本Glibc}
+Ubuntu自带的glibc版本是2.23, 我们在不替换原系统glib的情况下，若要使用高版本glibc当作共享链接库，则\textbf{万万不可像jemalloc那样运行\Verb+ ldconfig+}。
+
+原因是，glibc并不单纯的包含libc.so.2，而是包含了该对应版本的链接器等一系列工具链，如果我们此时还在使用旧版本的glibc，而运行了\Verb+ ldconfig+之后，就会造成系统的共享链接库错误，此时唯一的解决办法是重新安装系统。因此如果使用高版本的glibc共享库的话，我们就需要指定额外的参数传递给gcc编译器: 
+\begin{minted}[breaklines, frame=lines]{bash}
+$ gcc -g3 -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 house_of_einherjar.c -o house_of_einherjar
+
+$ ldd house_of_einherjar                                                                                                                                                   
+    linux-vdso.so.1 =>  (0x00007ffe979ef000)
+    libc.so.6 => /root/tmpwork/g227/lib/libc.so.6 (0x00007fb64da78000)
+    /root/tmpwork/g227/lib/ld-linux-x86-64.so.2 => /lib64/ld-linux-x86-64.so.2 (0x00007fb64de2d000)
+
+\end{minted}
+
+其中，\Verb+ -Wl+指的是将该参数传递给链接器，我们在编译时指定了所使用的动态链接库，以及和该版本动态链接库对应的链接器。这样，程序就可以使用高版本的glibc了。
+
+\newpage

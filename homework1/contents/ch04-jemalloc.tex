@@ -1,0 +1,38 @@
+\begin{center}
+    \section{jemalloc 分析}
+\end{center}
+
+\setlength{\parindent}{2em}
+此处分析的版本为jemalloc-5.0.1中的\verb+ malloc+实现。
+为了方便调试，我们可以在编译\verb+ jemalloc+的时候保留调试符号信息：\verb+ --enable-debug+。
+修改\verb+ Makefile+，使用jemalloc编译how2heap的二进制文件：
+\begin{minted}[breaklines, frame=lines]{bash}
+PROGRAMS = fastbin_dup fastbin_dup_into_stack fastbin_dup_consolidate unsafe_unlink house_of_spirit poison_null_byte malloc_playground first_fit house_of_lore overlapping_chunks overlapping_chunks_2 house_of_force unsorted_bin_attack house_of_einherjar house_of_orange
+CFLAGS += -std=c99 -g
+LDFLAGS += -L/usr/local/jemalloc/lib
+LDLIBS += -ljemalloc
+# Convenience to auto-call mcheck before the first malloc()
+#CFLAGS += -lmcheck
+
+all: $(PROGRAMS)
+clean:
+    rm -f $(PROGRAMS)
+\end{minted}
+
+\subsection{unsafe\_unlink}
+
+\subsection{house\_of\_spirit}
+
+\subsection{house\_of\_lore}
+
+\subsection{house\_of\_einherjar}
+
+\subsection{house\_of\_orange}
+
+\subsection{house\_of\_force}
+
+\subsection{poison\_null\_byte}
+
+\subsection{unsorted\_bin\_attack}
+
+\newpage

