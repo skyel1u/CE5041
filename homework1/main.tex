@@ -5,9 +5,21 @@
 \usepackage{minted}
 \usepackage{url}
 \usepackage{geometry}
+\usepackage{fancyhdr}
+% -- page settings
 \geometry{a4paper,left=2cm,right=2cm,top=3cm,bottom=2cm}
 
-\title{软件安全与漏洞分析大作业-I}
+% -- header & footers
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\schoolname{}}
+\lhead{\classname{}}
+\rfoot{\thepage}
+
+% -- defs
+\def\schoolname{School of Cyber Engineering, Xidian University}
+\def\classname{软件安全与漏洞分析}
+\title{\classname{} 大作业}
 
 \author{LIU Jin\\
 15180110082 \\
@@ -53,10 +65,10 @@ codeklaus@gmail.com
 % \input{contents/ch02-how2heap.tex}
 
 % Section 3 ptmalloc
-% \input{contents/ch03-ptmalloc.tex}
+\input{contents/ch03-ptmalloc.tex}
 
 % Section 4 jemalloc
-\input{contents/ch04-jemalloc.tex}
+% \input{contents/ch04-jemalloc.tex}
 
 % Section 5
 % \input{contents/ch05-peoblems.tex}
