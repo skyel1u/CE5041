@@ -19,7 +19,35 @@ clean:
     rm -f $(PROGRAMS)
 \end{minted}
 
+\subsection{jemalloc的介绍}
+
+现代CPU已大多数为多核CPU，多线程的应用程序也越来越广泛，内存的分配与回收也越来越成为制约程序性能的一大原因。因此为多核多线程的堆管理器jemalloc应运而生。
+
+在过去，分配器使用\verb+ sbrk(2)+来获得内存，由于多种原因，其中包括竞争条件，碎片增加以及最大可用内存的人为限制，这是不理想的。 如果操作系统支持\verb+ sbrk(2)+，则该分配器按照该优先顺序同时使用\verb+ mmap(2)+和\verb+ sbrk(2)+; 否则仅使用\verb+ mmap(2)+。
+
+这个堆分配器会使用多arena的方式来减少多核系统上多线程程序的锁竞争。除了多个arena之外，该分配器还支持线程特定的缓存，以便可以完全避免大多数分配请求的同步。 这样的缓存允许在正常情况下进行快速分配，但是它增加了内存的使用和分段，因为有限数量的对象可以在每个线程缓存中一直保存被分配的状态。
+
+从jemalloc 5.0.0版本开始，不再使用"chunks"这个数据结构进行虚拟内存的管理，而是去使用一个新的，页面对齐的数据结构——extents。（于是之前几乎所有关于jemalooc的资料全部作废了，就是一夜回到解放前看源码）
+
+在jemalloc的最新设计中，内存区域在概念上被划分为extents，extents始终与页面大小的倍数对齐，这种对齐可以让用户更快速的找到储存的元数据。用户的对象被分为大小两类，连续的小对象包含一个slab，也就是一个单一的extent，而大的对象则有自己的extents支持。
+
+小的对象由slab分组管理，而每一个slab则维护一个bitmap追踪哪些区域正在被使用。不超过1 quantum一半的分配请求（8或16，依据架构而定）将四舍五入到最接近的2的幂，至少是\verb+ sizeof(double)+。
+
 \subsection{unsafe\_unlink}
+
+由于jemalloc的实现和ptmalloc并不相同，没有采用边界标记来在堆分配的时候标记数据，而是使用了bitmap，因此jemalloc对unlink攻击免疫。
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap ./unsafe_unlink
+The global chunk0_ptr is at 0x601070, pointing to 0x7ff94e61e000
+The victim chunk we are going to corrupt is at 0x7ff94e61e080
+
+Fake chunk fd: 0x601058
+Fake chunk bk: 0x601060
+
+Original value: AAAAAAAA
+New Value: AAAAAAAA
+
+\end{minted}
 
 \subsection{house\_of\_spirit}
 
