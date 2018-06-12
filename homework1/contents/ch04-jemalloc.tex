@@ -35,7 +35,7 @@ clean:
 
 \subsection{unsafe\_unlink}
 
-由于jemalloc的实现和ptmalloc并不相同，没有采用边界标记来在堆分配的时候标记数据，而是使用了bitmap，因此jemalloc对unlink攻击免疫。
+由于jemalloc的实现和ptmalloc并不相同，没有采用边界标记来在堆分配的时候标记数据，而是使用了bitmap标记内存的使用情况，因此jemalloc对unlink攻击免疫，所以unlink攻击无法成功。
 \begin{minted}[breaklines, frame=lines]{bash}
 $ how2heap ./unsafe_unlink
 The global chunk0_ptr is at 0x601070, pointing to 0x7ff94e61e000
@@ -51,7 +51,111 @@ New Value: AAAAAAAA
 
 \subsection{house\_of\_spirit}
 
+攻击失败，运行结果如下：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap ./house_of_spirit
+We will overwrite a pointer to point to a fake 'fastbin' region. This region contains two chunks.
+The first one:  0x7ffd67374070
+The second one: 0x7ffd67374090
+Overwritting our pointer with the address of the fake region inside the fake first chunk, 0x7ffd67374070.
+Freeing the overwritten pointer.
+<jemalloc>: src/rtree.c:205: Failed assertion: "!dependent || leaf != NULL"
+[1]    27382 abort      ./house_of_spirit
+
+\end{minted}
+
+free时会调用jemalloc中的\verb+ free()+，跟踪进入\verb+ free()+调用的\verb+ ifree()+：
+\begin{minted}[breaklines, frame=lines]{c}
+ifree(tsd=0x7ffff7fde728, ptr=0x7fffffffe480, tcache=0x7ffff7fde8e0, slow_path=0x1);
+\end{minted}
+
+继续跟入，\verb+ tsd_tsdn()+函数十分简洁，且作用是强制类型转换，我们可以略过，进入\verb+ ifree()+中调用的\verb+ idalloctm()+函数，再进入\verb+ arena_dalloc()+：
+\begin{minted}[breaklines, frame=lines]{c}
+// arena_dalloc(tsdn=0x7ffff7fde728, ptr=0x7fffffffe480, tcache=0x7ffff7fde8e0, alloc_ctx=0x7fffffffe3f0, slow_path=0x1)
+    // config_debug = 1, 进入
+    if (config_debug) {
+        rtree_ctx = tsd_rtree_ctx(tsdn_tsd(tsdn));
+        // extent=0x00007fffffffe348  →  [...]  →  0x0000000100000101, tsdn=0x00007fffffffe328  →  [...]  →  0x0000000100000101
+        extent_t *extent = rtree_extent_read(tsdn, &extents_rtree,
+            rtree_ctx, (uintptr_t)ptr, true);
+        // extent=0x00007fffffffe348  →  0x0000000000000000
+        assert(szind == extent_szind_get(extent));
+        assert(szind < NSIZES);
+        assert(slab == extent_slab_get(extent));
+    }
+    // 略去无关函数
+\end{minted}
+
+我们在\verb+ extent_szind_get(extent)+函数中调用的\verb+ extent_szind_get_maybe_invalid(extent)+中有如下操作：
+\begin{minted}[breaklines, frame=lines]{c}
+    static inline szind_t
+        extent_szind_get_maybe_invalid(const extent_t *extent) {
+        // extent=0x00007fffffffe2a8  →  0x0000000000000000
+        szind_t szind = (szind_t)((extent->e_bits & EXTENT_BITS_SZIND_MASK) >>
+            EXTENT_BITS_SZIND_SHIFT);
+        assert(szind <= NSIZES);
+        return szind;
+}
+
+\end{minted}
+
+extent的值由\verb+ 0x00007fffffffe2a8+变成了一个非法地址\verb+ 0x0000000000000000+，因此\verb+ extent->e_bits+无法计算，所以，\verb+ szind+的值与\verb+ NSIZES+（该值此时为0xE8）无法比较，因此程序收到终止信号，程序退出。
+
 \subsection{house\_of\_lore}
+
+攻击失败：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap ./house_of_lore 
+Allocated the victim (small) chunk: 0x7fd6d8878000
+stack_buffer_1: 0x7ffd6419e2a0
+stack_buffer_2: 0x7ffd6419e280
+
+Freeing the victim chunk 0x7fd6d8878000, it will be inserted in the unsorted bin
+victim->fd: 0x5a5a5a5a5a5a5a5a
+victim->bk: 0x5a5a5a5a5a5a5a5a
+
+Malloc a chunk that can't be handled by the unsorted bin, nor the SmallBin: 0x7fd6d887a000
+The victim chunk 0x7fd6d8878000 will be inserted in front of the SmallBin
+victim->fd: 0x5a5a5a5a5a5a5a5a
+victim->bk: 0x5a5a5a5a5a5a5a5a
+
+Now emulating a vulnerability that can overwrite the victim->bk pointer
+This last malloc should return a chunk at the position injected in bin->bk: 0x7fd6d8878000
+The fd pointer of stack_buffer_2 has changed: 0x7ffd6419e2a0
+
+\end{minted}
+
+gdb打开应用，在free之前下断点，堆布局是这样的：
+\begin{minted}[breaklines, frame=lines]{c}
+gef> x/20gx victim-2
+0x7ffff64a4ff0: 0x0000000000000000  0x0000000000000000
+0x7ffff64a5000: 0x4141414141414141  0x4141414141414141
+...           : ...                 ..
+0x7ffff64a5070: 0x4141414141414141  0x4141414141414141
+0x7ffff64a5080: 0x0000000000000000  0x0000000000000000
+\end{minted}
+
+之前就已经提到过，jemalloc没有采用边界标记法表示内存，因此没有在分配内存的附近有标记，如果使用glibc的堆布局就如下所示：
+\begin{minted}[breaklines, frame=lines]{c}
+gef> x/20gx victim-2
+0x603000:   0x0000000000000000  0x0000000000000091 <- size
+0x603010:   0x4141414141414141  0x4141414141414141
+...     :   ...                 ...
+0x603080:   0x4141414141414141  0x4141414141414141
+0x603090:   0x0000000000000000  0x0000000000000021 <- next size
+\end{minted}
+
+\verb+ free()+之后，我们的堆布局变成了下面的样子：
+\begin{minted}[breaklines, frame=lines]{bash}
+gef> x/20gx victim-2
+0x7ffff64a4ff0: 0x0000000000000000  0x0000000000000000
+0x7ffff64a5000: 0x5a5a5a5a5a5a5a5a  0x5a5a5a5a5a5a5a5a
+...           : ...                 ...
+0x7ffff64a5070: 0x5a5a5a5a5a5a5a5a  0x5a5a5a5a5a5a5a5a
+0x7ffff64a5080: 0x0000000000000000  0x0000000000000000
+\end{minted}
+
+jemalloc在free某块内存之后，不仅会在bitmap中标记，还会填充特定的字符，因此攻击失效。
 
 \subsection{house\_of\_einherjar}
 

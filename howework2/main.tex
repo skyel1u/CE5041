@@ -5,11 +5,9 @@
 \usepackage{minted}
 \usepackage{url}
 \usepackage{geometry}
-\usepackage{setspace}
 \usepackage{fancyhdr}
 % -- page settings
 \geometry{a4paper,left=2cm,right=2cm,top=3cm,bottom=2cm}
-\renewcommand{\baselinestretch}{1.5}
 
 % -- header & footers
 \pagestyle{fancy}
@@ -21,9 +19,8 @@
 % -- defs
 \def\schoolname{School of Cyber Engineering, Xidian University}
 \def\classname{软件安全与漏洞分析}
-\title{\Huge{\classname{} 大作业}}
+\title{\classname{} 大作业}
 
-\vfill
 \author{LIU Jin\\
 15180110082 \\
 \small{liujin.xdu@pm.me} \and
@@ -37,8 +34,6 @@ WANG Xu\\
 15130120190 \\
 \small{codeklaus@gmail.com}
 }
-% 
-\date{\today}
 
 \begin{document}
 \maketitle
@@ -53,33 +48,14 @@ WANG Xu\\
 \newpage
 
 \begin{center}
-    \section{引言}
+    \section{分析}
 \end{center}
 
 % 添加首行缩进，两个字符
 \setlength{\parindent}{2em}
 
- \LaTeX 真好用。
- 
- 首先，我们在glibc版本是2.23的Ubuntu系统上编译了\verb+ how2heap+中的案例，分析了\verb+ how2heap+中的堆利用手段，然后分别在Glibc-2.27版本和jemalloc-5.0.1版本中分析了上述攻击手段成功或失败的原因，最后列举了一下在写大作业中的坑。
- 
- 这部分内容前前后后写了一个月，于是就老老实实当了一个多月的ptmalloc拳击手。
 
 \newpage
-% Section 2 analysis how2heap
-% \input{contents/ch02-how2heap.tex}
-
-% Section 3 ptmalloc
-% \input{contents/ch03-ptmalloc.tex}
-
-% Section 4 jemalloc
-\input{contents/ch04-jemalloc.tex}
-
-% Section 5
-% \input{contents/ch05-peoblems.tex}
-
-% Section 6 Refenence
-% \input{refenences.tex}
 
 
 
