@@ -19,7 +19,7 @@ clean:
     rm -f $(PROGRAMS)
 \end{minted}
 
-\subsection{jemalloc的介绍}
+\subsection{jemalloc简介}
 
 现代CPU已大多数为多核CPU，多线程的应用程序也越来越广泛，内存的分配与回收也越来越成为制约程序性能的一大原因。因此为多核多线程的堆管理器jemalloc应运而生。
 
@@ -159,9 +159,84 @@ jemalloc在free某块内存之后，不仅会在bitmap中标记，还会填充�
 
 \subsection{house\_of\_einherjar}
 
+前面的分析已经提到过，house-of-einherjar 是一种利用 malloc 来返回一个附近地址的任意指针。它要求有一个单字节溢出漏洞，覆盖掉\verb+ next chunk+的 \verb+ size+字段并清除\verb+ PREV_IN_USE+标志。jemalloc没有采用边界标记的方法标记\verb+ free chunks+，因此本次攻击也是不成功的。
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap ./house_of_einherjar
+We allocate 0x10 bytes for 'a': 0x7f6121abf000
+
+Our fake chunk at 0x7ffe5fe58050 looks like:
+prev_size: 0x80
+size: 0x80
+fwd: 0x7ffe5fe58050
+bck: 0x7ffe5fe58050
+fwd_nextsize: 0x7ffe5fe58050
+bck_nextsize: 0x7ffe5fe58050
+
+We allocate 0xf8 bytes for 'b': 0x7f6121ac0000
+b.size: 0
+We overflow 'a' with a single null byte into the metadata of 'b'
+b.size: 0
+
+We write a fake prev_size to the last 8 bytes of a so that it will consolidate with our fake chunk
+Our fake prev_size will be 0x7f6121abfff0 - 0x7ffe5fe58050 = 0xffffff62c1c67fa0
+
+Modify fake chunk's size to reflect b's new prev_size
+Now we free b and this will consolidate with our fake chunk
+Our fake chunk size is now 0xffffff62c1c67fa0 (b.size + fake_prev_size)
+
+Now we can call malloc() and it will begin in our fake chunk: 0x7f6121abf010
+\end{minted}
+
+在分配\verb+ b+时下断点，查看堆布局：
+\begin{minted}[breaklines, frame=lines]{bash}
+gef$ x/50gx b-0x10
+0x7ffff64a5ff0: 0x0000000000000000  0x0000000000000000
+0x7ffff64a6000: 0xa5a5a5a5a5a5a5a5  0xa5a5a5a5a5a5a5a5
+...           : ...                 ...
+0x7ffff64a60f0: 0xa5a5a5a5a5a5a5a5  0xa5a5a5a5a5a5a5a5
+0x7ffff64a6100: 0x0000000000000000  0x0000000000000000
+\end{minted}
+
+而使用glibc分配的内存如下所示：
+\begin{minted}[breaklines, frame=lines]{bash}
+gef$ x/50gx b-0x10
+0x603020:   0x4141414141414141  0x0000000000000101 <- P flag
+0x603030:   0x0000000000000000  0x0000000000000000 -
+...     :   ...                 ...                | <- chunk b
+0x603120:   0x0000000000000000  0x0000000000020ee1 -
+0x603130:   0x0000000000000000  0x0000000000000000
+\end{minted}
+
+综上，本次攻击也是失败的。
+
 \subsection{house\_of\_orange}
 
+运行程序没有任何输出，自然是攻击失败：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap ./house_of_orange
+$ how2heap 
+
+\end{minted}
+
 \subsection{house\_of\_force}
+
+攻击失败：
+
+\begin{minted}[breaklines, frame=lines]{bash}
+$ how2heap ./house_of_force 
+We will overwrite a variable at 0x602080
+
+Let's allocate the first chunk of 0x10 bytes: 0x7f35be7cf000.
+Real size of our allocated chunk is 0x10.
+
+Overwriting the top chunk size with a big value so the malloc will never call mmap.
+Old size of top chunk: 0
+New size of top chunk: 0xffffffffffffffff
+
+The value we want to write to at 0x602080, and the top chunk is at 0x7f35be7cf010, so accounting for the header size, we will malloc 0xffff80ca41e33060 bytes.
+[1]    12108 segmentation fault  ./house_of_force
+
+\end{minted}
 
 \subsection{poison\_null\_byte}
 
@@ -176,5 +251,7 @@ jemalloc在free某块内存之后，不仅会在bitmap中标记，还会填充�
 \subsection{overlapping\_chunks}
 
 \subsection{overlapping\_chunks\_2}
+
+\subsection{Conclusion}
 
 \newpage
