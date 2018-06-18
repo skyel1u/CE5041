@@ -241,6 +241,8 @@ $ how2heap
 
 \end{minted}
 
+前文提到，house\_of\_orange的攻击是利用\verb+ unsorted_bins+的\verb+ unlink+伪造 \verb+ _IO_jump_t+中的\verb+ __overflo+为\verb+ system()+函数的地址，从而达到执行 shell 的目的；而jemalloc中既没有\verb+ unsorted_bins+，也没有\verb+ unlink+，因此攻击失败。
+
 \subsection{house\_of\_force}
 
 攻击失败：
@@ -261,9 +263,32 @@ The value we want to write to at 0x602080, and the top chunk is at 0x7f35be7cf01
 
 \end{minted}
 
+前文已经说过，house\_of\_lore 的原理是通过破坏已经放入small bins 中的\verb+ bk+ 指针来达到取得任意地址的目的，jemalloc没有采用链表的结构管理bins，自然攻击失败。
+
 \subsection{poison\_null\_byte}
 
 \subsection{unsorted\_bin\_attack}
+
+不成功，jemalloc中既没有\verb+ unsorted_bins+这个数据结构，也不是通过链表管理bins：
+\begin{minted}[breaklines, frame=lines]{bash}
+$./unsorted_bin_attack 
+This file demonstrates unsorted bin attack by write a large unsigned long value into stack
+In practice, unsorted bin attack is generally prepared for further attacks, such as rewriting the global variable global_max_fast in libc for further fastbin attack
+
+Let's first look at the target we want to rewrite on stack:
+0x7ffc82427168: 0
+
+Now, we allocate first normal chunk on the heap at: 0x7fd534473000
+And allocate another normal chunk in order to avoid consolidating the top chunk withthe first one during the free()
+
+We free the first chunk now and it will be inserted in the unsorted bin with its bk pointer point to 0x5a5a5a5a5a5a5a5a
+Now emulating a vulnerability that can overwrite the victim->bk pointer
+And we write it with the target address-16 (in 32-bits machine, it should be target address-8):0x7ffc82427158
+
+Let's malloc again to get the chunk we just free. During this time, target should has already been rewrite:
+0x7ffc82427168: (nil)
+
+\end{minted}
 
 \subsection{unsorted\_bin\_into\_stack}
 
@@ -290,7 +315,7 @@ Now the free list has [ 0x7f301d3a6008, 0x7f301d3a6010, 0x7f301d3a6008 ]. If we 
 
 看上去结果和Glibc的类似，实际上内部完全不同。前文已经提到，对于小块内存，jemalloc使用slab来管理。
 
-可以猜测对于小块内存，je采用了一种栈结构来管理，写demo验证即可：
+可以猜测对于小块内存，je如果在使用tcache的情况下，采用了一种栈的数据结构结构来管理，写demo，先malloc三次，再free三次，再malloc，那么我们得到的还是之前的内存的地址：
 \begin{minted}[breaklines, frame=lines]{c}
 #include <stdio.h>
 #include <stdlib.h>
@@ -332,12 +357,218 @@ c: 0xe8d64008
 
 \end{minted}
 
-可以看出是一个先入后出的结构，实际上在jemalloc源码中也能看到有关此结构的定义。
+可以看出是一个先入后出的结构，实际上在jemalloc源码中也能看到有关此结构的定义：
+\begin{minted}[breaklines, frame=lines]{c}
+// tcache_s
+struct tcache_s
+{
+    /* Data accessed frequently first: prof, ticker and small bins. */
+    uint64_t prof_accumbytes; /* Cleared after arena_prof_accum(). */
+    ticker_t gc_ticker;       /* Drives incremental GC. */
+    /*
+     * The pointer stacks associated with tbins follow as a contiguous
+     * array.  During tcache initialization, the avail pointer in each
+     * element of tbins is initialized to point to the proper offset within
+     * this array.
+     */
+    tcache_bin_t tbins_small[NBINS];
+    /* Data accessed less often below. */
+    ql_elm(tcache_t) link; /* Used for aggregating stats. */
+    arena_t *arena;        /* Associated arena. */
+    szind_t next_gc_bin;   /* Next bin to GC. */
+    /* For small bins, fill (ncached_max >> lg_fill_div). */
+    uint8_t lg_fill_div[NBINS];
+    tcache_bin_t tbins_large[NSIZES - NBINS];
+};
+
+// tcache_bin_s
+struct tcache_bin_s
+{
+      low_water_t low_water; /* Min # cached since last GC. */
+      uint32_t ncached; /* # of cached objects. */
+      /*
+     * ncached and stats are both modified frequently.  Let's keep them
+     * close so that they have a higher chance of being on the same
+     * cacheline, thus less write-backs.
+     */
+      tcache_bin_stats_t tstats;
+      /*
+     * To make use of adjacent cacheline prefetch, the items in the avail
+     * stack goes to higher address for newer allocations.  avail points
+     * just above the available space, which means that
+     * avail[-ncached, ... -1] are available items and the lowest item will
+     * be allocated first.
+     */
+      void **avail; /* Stack of available objects. */
+};
+\end{minted}
+
+实际上我们可以画一个简单的图表示：
+\begin{minted}[breaklines, frame=lines]{bash}
+            +---------------------+
+          / | link                |
+tcache_t <  | prof_accumbytes     |
+          | | gc_ticker           |
+          \ | next_gc_bin         |
+            |---------------------|
+          / | tstats              |
+          | | low_water           |
+tbins[0] <  | lg_fill_div         |
+          | | ncached             |
+          \ | avail               |--+
+            |---------------------|  |
+          / | tstats              |  |
+          | | low_water           |  |
+          | | lg_fill_div         |  |                     Run
+tbins[1] <  | ncached             |  |                +-----------+
+          | | avail               |--|--+             |  region   |
+          \ |---------------------|  |  |             |-----------|
+            ...  ...  ...            |  |   +-------->|  region   |
+            |---------------------|  |  |   |         |-----------|
+            | padding             |  |  |   |         |  region   |
+            |---------------------|<-+  |   |         |-----------|
+            | stack[0]            |-----|---+   +---->|  region   |
+            | stack[1]            |-----|-------+     |-----------|
+            | ...                 |     |             |  region   |
+            | stack[ncache_max-1] |     |             |-----------|
+            |---------------------|<----+      +----->|  region   |
+            | stack[0]            |------------+      |-----------|
+            | stack[1]            |                   |           |
+            | ...                 |                   |           |
+            | stack[ncache_max-1] |                   |           |
+            |---------------------|                   |           |
+            ...  ...  ...                             ...  ...  ...
+            +---------------------+                   +-----------+
+\end{minted}
 
 \subsection{fastbin\_dup\_into\_stack}
 
+看上去结果和glibc的类似，实际上攻击是不成功的：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ ./fastbin_dup_into_stack 
+This file extends on fastbin_dup.c by tricking malloc into
+returning a pointer to a controlled location (in this case, the stack).
+The address we want malloc() to return is 0x7ffe12338c88.
+Allocating 3 buffers.
+1st malloc(8): 0x7f979bad3008
+2nd malloc(8): 0x7f979bad3010
+3rd malloc(8): 0x7f979bad3018
+Freeing the first one...
+If we free 0x7f979bad3008 again, things will crash because 0x7f979bad3008 is at the top of the free list.
+So, instead, we'll free 0x7f979bad3010.
+Now, we can free 0x7f979bad3008 again, since it's not the head of the free list.
+Now the free list has [ 0x7f979bad3008, 0x7f979bad3010, 0x7f979bad3008 ]. We'll now carry out our attack by modifying data at 0x7f979bad3008.
+1st malloc(8): 0x7f979bad3008
+2nd malloc(8): 0x7f979bad3010
+Now the free list has [ 0x7f979bad3008 ].
+Now, we have access to 0x7f979bad3008 while it remains at the head of the free list.
+so now we are writing a fake free size (in this case, 0x20) to the stack,
+so that malloc will think there is a free chunk there and agree to
+return a pointer to it.
+Now, we overwrite the first 8 bytes of the data at 0x7f979bad3008 to point right before the 0x20.
+3rd malloc(8): 0x7f979bad3008, putting the stack address on the free list
+4th malloc(8): 0x7f979bad3020
+
+\end{minted}
+
+在上一个攻击：fastbin\_dup中我们已经分析过，这里就不赘述了。
+
 \subsection{overlapping\_chunks}
 
+攻击失败，前面提到，overlapping\_chunks的攻击方法是改写\verb+ unsorted bin +中空闲堆块的 size，改变下一次\verb+ malloc()+可以返回的堆块大小，jemalloc未采用边界标记的方法标记内存，自然攻击不成功:
+\begin{minted}[breaklines, frame=lines]{bash}
+$ ./overlapping_chunks 
+
+This is a simple chunks overlapping problem
+
+Let's start to allocate 3 chunks on the heap
+The 3 chunks have been allocated here:
+p1=0x7f2e4b5af000
+p2=0x7f2e4b5af100
+p3=0x7f2e4b5b0000
+
+Now let's free the chunk p2
+The chunk p2 is now in the unsorted bin ready to serve possible
+new malloc() of its size
+Now let's simulate an overflow that can overwrite the size of the
+chunk freed p2.
+For a toy program, the value of the last 3 bits is unimportant; however, it is best to maintain the stability of the heap.
+To achieve this stability we will mark the least signifigant bit as 1 (prev_inuse), to assure that p1 is not mistaken for a free chunk.
+We are going to set the size of chunk p2 to to 385, which gives us
+a region size of 376
+
+Now let's allocate another chunk with a size equal to the data
+size of the chunk p2 injected size
+This malloc will be served from the previously freed chunk that
+is parked in the unsorted bin which size has been modified by us
+
+p4 has been allocated at 0x7f2e4b5b1000 and ends at 0x7f2e4b5b1bc0
+p3 starts at 0x7f2e4b5b0000 and ends at 0x7f2e4b5b0280
+p4 should overlap with p3, in this case p4 includes all p3.
+
+Now everything copied inside chunk p4 can overwrites data on
+chunk p3, and data written to chunk p3 can overwrite data
+stored in the p4 chunk.
+
+Let's run through an example. Right now, we have:
+p4 = ¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+p3 = 33333333333333333333333333333333333333333333333333333333333333
+3333333333333333333333333333333333333333333333333333333333¥¥¥¥¥¥¥¥
+
+If we memset(p4, '4', 376), we have:
+p4 = 44444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444¥¥¥¥¥¥¥¥
+p3 = 33333333333333333333333333333333333333333333333333333333333333
+3333333333333333333333333333333333333333333333333333333333¥¥¥¥¥¥¥¥
+
+And if we then memset(p3, '3', 80), we have:
+p4 = 44444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444444444444444444444444
+4444444444444444444444444444444444444444444444¥¥¥¥¥¥¥¥
+p3 = 33333333333333333333333333333333333333333333333333333333333333
+3333333333333333333333333333333333333333333333333333333333¥¥¥¥¥¥¥¥
+\end{minted}
+
 \subsection{overlapping\_chunks\_2}
+
+攻击失败，原因同上：
+\begin{minted}[breaklines, frame=lines]{bash}
+➜ ./overlapping_chunks_2
+Now we allocate 5 chunks on the heap
+
+chunk p1: 0x7f160857f000 ~ 0x7f160857f010
+chunk p2: 0x7f1608580000 ~ 0x7f1608580080
+chunk p3: 0x7f1608580080 ~ 0x7f1608580100
+chunk p4: 0x7f1608580100 ~ 0x7f1608580180
+chunk p5: 0x7f160857f010 ~ 0x7f160857f020
+
+Let's free the chunk p4
+
+Emulating an overflow that can overwrite the size of chunk p2 with (size of chunk_p2 + size of chunk_p3)
+
+Allocating a new chunk 6: 0x7f1608581000 ~ 0x7f16085811c0
+
+Now p6 and p3 are overlapping, if we memset(p6, 'B', 0xd0)
+p3 before = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
+ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
+p3 after  = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
+ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
+\end{minted}
 
 \newpage
