@@ -33,6 +33,29 @@ clean:
 
 小的对象由slab分组管理，而每一个slab则维护一个bitmap追踪哪些区域正在被使用。不超过1 quantum一半的分配请求（8或16，依据架构而定）将四舍五入到最接近的2的幂，至少是\verb+ sizeof(double)+。
 
+具体大小和分类见下表 \footnote{详见：http://jemalloc.net/jemalloc.3.html\#size\_classes}：
+% Please add the following required packages to your document preamble:
+\begin{table}[]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\multicolumn{1}{|c|}{Category} & Spacing & Size                                   \\ \hline
+\multirow{9}{*}{Small}               & lg      & {[}8{]}                                \\ \cline{2-3} 
+                               & 16      & {[}16, 32, 48, 64, 80, 96, 112, 128{]} \\ \cline{2-3} 
+                               & 32      & {[}160, 192, 224, 256{]}               \\ \cline{2-3} 
+                               & 64      & {[}320, 384, 448, 512{]}               \\ \cline{2-3} 
+                               & 128     & {[}640, 768, 896, 1024{]}              \\ \cline{2-3} 
+                               & 256     & {[}1280, 1536, 1792, 2048{]}           \\ \cline{2-3} 
+                               & 512     & {[}2560, 3072, 3584, 4096{]}           \\ \cline{2-3} 
+                               & 1KiB    & {[}5 KiB, 6 KiB, 7 KiB, 8 KiB{]}       \\ \cline{2-3} 
+                               & 2KiB    & {[}10 KiB, 12 KiB, 14 KiB{]}           \\ \hline
+\multirow{3}{*}{Large}               & 2 KiB   & {[}16 KiB{]}                           \\ \cline{2-3} 
+                               & ...     & ..                                     \\ \cline{2-3} 
+                               & 1 EiB   & {[}5 EiB, 6 EiB, 7 EiB{]}              \\ \hline
+\end{tabular}
+\end{table}
+
+
 \subsection{unsafe\_unlink}
 
 由于jemalloc的实现和ptmalloc并不相同，没有采用边界标记来在堆分配的时候标记数据，而是使用了bitmap标记内存的使用情况，因此jemalloc对unlink攻击免疫，所以unlink攻击无法成功。
@@ -246,12 +269,75 @@ The value we want to write to at 0x602080, and the top chunk is at 0x7f35be7cf01
 
 \subsection{fastbin\_dup}
 
+编译，运行：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ ./fastbin_dup
+This file demonstrates a simple double-free attack with fastbins.
+Allocating 3 buffers.
+1st malloc(8): 0x7f301d3a6008
+2nd malloc(8): 0x7f301d3a6010
+3rd malloc(8): 0x7f301d3a6018
+Freeing the first one...
+If we free 0x7f301d3a6008 again, things will crash because 0x7f301d3a6008 is at the top of the free list.
+So, instead, we'll free 0x7f301d3a6010.
+Now, we can free 0x7f301d3a6008 again, since it's not the head of the free list.
+Now the free list has [ 0x7f301d3a6008, 0x7f301d3a6010, 0x7f301d3a6008 ]. If we malloc 3 times, we'll get 0x7f301d3a6008 twice!
+1st malloc(8): 0x7f301d3a6008
+2nd malloc(8): 0x7f301d3a6010
+3rd malloc(8): 0x7f301d3a6008
+
+\end{minted}
+
+看上去结果和Glibc的类似，实际上内部完全不同。前文已经提到，对于小块内存，jemalloc使用slab来管理。
+
+可以猜测对于小块内存，je采用了一种栈结构来管理，写demo验证即可：
+\begin{minted}[breaklines, frame=lines]{c}
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(){
+    long *a, *b, *c;
+    a = malloc(8);
+    b = malloc(8);
+    c = malloc(8);
+    printf("a: %#x\n", a);
+    printf("b: %#x\n", b);
+    printf("c: %#x\n", c);
+    free(a);
+    free(b);
+    free(c);
+    a = malloc(8);
+    b = malloc(8);
+    c = malloc(8);
+    printf("a: %#x\n", a);
+    printf("b: %#x\n", b);
+    printf("c: %#x\n", c);
+
+    return 0;
+
+}
+
+\end{minted}
+
+运行得到结果：
+\begin{minted}[breaklines, frame=lines]{bash}
+$ ./haha       
+a: 0xe8d64008
+b: 0xe8d64010
+c: 0xe8d64018
+a: 0xe8d64018
+b: 0xe8d64010
+c: 0xe8d64008
+
+\end{minted}
+
+可以看出是一个先入后出的结构，实际上在jemalloc源码中也能看到有关此结构的定义。
+
 \subsection{fastbin\_dup\_into\_stack}
 
 \subsection{overlapping\_chunks}
 
 \subsection{overlapping\_chunks\_2}
-
-\subsection{Conclusion}
 
 \newpage

